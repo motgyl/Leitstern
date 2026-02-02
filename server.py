@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Message server for peer-to-peer communication via netcat
+Advanced message server with chat, tasks, and AI integration
+Features: authentication, chat, task management, Groq AI
 """
 
 import socket
@@ -8,21 +9,30 @@ import threading
 import json
 from datetime import datetime
 import os
-import base64
 import sys
 import logging
+import hashlib
+import uuid
+from typing import Dict, List, Optional, Tuple
+
+# Try to import Groq, but don't fail if it's not installed
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    Groq = None
 
 HOST = '0.0.0.0'
 PORT = 7002
-MESSAGES_FILE = 'messages.json'
-FILES_DIR = 'shared_files'
+DATA_DIR = 'data'
 LOGS_DIR = 'logs'
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')  # Set via environment variable
 
 # Create directories if they don't exist
-if not os.path.exists(FILES_DIR):
-    os.makedirs(FILES_DIR)
-if not os.path.exists(LOGS_DIR):
-    os.makedirs(LOGS_DIR)
+for d in [DATA_DIR, LOGS_DIR]:
+    if not os.path.exists(d):
+        os.makedirs(d)
 
 # Setup logging
 log_file = os.path.join(LOGS_DIR, 'server.log')
@@ -45,76 +55,186 @@ ch.setFormatter(formatter)
 logger.addHandler(fh)
 logger.addHandler(ch)
 
-# Shared message storage: [messages]
-messages = []
-# Active users dictionary: {socket: username}
-users = {}
+# Data storage
+users_db: Dict[str, dict] = {}  # {username: {password_hash, created_at}}
+sessions: Dict[str, str] = {}   # {session_id: username}
+chat_messages: List[dict] = []
+tasks: Dict[str, dict] = {}      # {task_id: {title, description, solution, status, created_by, created_at}}
+ai_chat_history: Dict[str, List[dict]] = {}  # {username: [{role, content}]}
+
 lock = threading.Lock()
 
+# Data file paths
+USERS_FILE = os.path.join(DATA_DIR, 'users.json')
+CHAT_FILE = os.path.join(DATA_DIR, 'chat.json')
+TASKS_FILE = os.path.join(DATA_DIR, 'tasks.json')
+AI_CHAT_FILE = os.path.join(DATA_DIR, 'ai_chat.json')
 
-def load_messages():
-    """Load messages from file"""
-    global messages
-    if os.path.exists(MESSAGES_FILE):
+
+def hash_password(password: str) -> str:
+    """Hash password using SHA256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def load_data():
+    """Load all data from files"""
+    global users_db, chat_messages, tasks, ai_chat_history
+    
+    if os.path.exists(USERS_FILE):
         try:
-            with open(MESSAGES_FILE, 'r') as f:
-                messages = json.load(f)
-                logger.info(f"Loaded {len(messages)} messages from file")
-        except Exception as e:
-            logger.error(f"Failed to load messages: {e}")
-            messages = []
-    else:
-        messages = []
+            with open(USERS_FILE, 'r') as f:
+                users_db = json.load(f)
+        except:
+            users_db = {}
+    
+    if os.path.exists(CHAT_FILE):
+        try:
+            with open(CHAT_FILE, 'r') as f:
+                chat_messages = json.load(f)
+        except:
+            chat_messages = []
+    
+    if os.path.exists(TASKS_FILE):
+        try:
+            with open(TASKS_FILE, 'r') as f:
+                tasks = json.load(f)
+        except:
+            tasks = {}
+    
+    if os.path.exists(AI_CHAT_FILE):
+        try:
+            with open(AI_CHAT_FILE, 'r') as f:
+                ai_chat_history = json.load(f)
+        except:
+            ai_chat_history = {}
 
 
-def save_messages():
-    """Save messages to file"""
+def save_data():
+    """Save all data to files"""
     try:
-        with open(MESSAGES_FILE, 'w') as f:
-            json.dump(messages, f, indent=2)
+        with open(USERS_FILE, 'w') as f:
+            json.dump(users_db, f, indent=2)
+        with open(CHAT_FILE, 'w') as f:
+            json.dump(chat_messages, f, indent=2)
+        with open(TASKS_FILE, 'w') as f:
+            json.dump(tasks, f, indent=2)
+        with open(AI_CHAT_FILE, 'w') as f:
+            json.dump(ai_chat_history, f, indent=2)
     except Exception as e:
-        logger.error(f"Failed to save messages: {e}")
+        logger.error(f"Failed to save data: {e}")
 
 
 def format_help():
     """Returns command help"""
     return """
 ========================================
-     Message Server (Memo)
+     Messenger with Tasks & AI
 ========================================
 
-Available commands:
-  help              - show this help
-  login <name>      - login with username
-  post              - start posting (enter multiple lines, type 'END' on new line to finish)
-  view              - view all messages
-  upload            - upload a file (binary-safe)
-  files             - list available files
-  download <name>   - download a file by name
-  users             - list all active users
-  quit              - exit
+AUTHENTICATION:
+  register <username> <password>  - register new account
+  login <username> <password>     - login to your account
+  logout                          - logout
 
-Examples:
-  login alice
-  post
-  [enter text...]
-  END
-  upload
-  files
-  download myfile.txt
-  quit
+CHAT (after login):
+  chat send <message>             - send message to chat
+  chat view                       - view all messages
+  chat view <count>               - view last N messages
+
+TASKS (after login):
+  task create <title>             - create new task
+  task add-desc <task_id>         - add description (multiline, end with 'END')
+  task add-sol <task_id>          - add solution (multiline, end with 'END')
+  task list                       - list all tasks
+  task view <task_id>             - view task details
+  task status <task_id> <status>  - change status (pending/in_progress/solved)
+  task delete <task_id>           - delete task
+
+AI CHAT (after login):
+  ai <message>                    - chat with AI (Groq)
+  ai clear                        - clear AI chat history
+
+OTHER:
+  help                            - show this help
+  quit                            - exit
 """.strip()
 
 
-def handle_client(client_socket, addr):
-    """Client connection handler"""
-    logger.info(f"Client connected: {addr}")
-    current_user = None
+def generate_session_id():
+    """Generate a new session ID"""
+    return str(uuid.uuid4())
+
+
+def authenticate_user(username: str, password: str) -> Optional[str]:
+    """Authenticate user and return session ID"""
+    with lock:
+        if username not in users_db:
+            return None
+        
+        if users_db[username]['password'] != hash_password(password):
+            return None
+        
+        session_id = generate_session_id()
+        sessions[session_id] = username
+        return session_id
+
+
+def register_user(username: str, password: str) -> bool:
+    """Register new user"""
+    with lock:
+        if username in users_db:
+            return False
+        
+        if len(username) < 3 or len(password) < 4:
+            return False
+        
+        users_db[username] = {
+            'password': hash_password(password),
+            'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        save_data()
+        return True
+
+
+def get_ai_response(user_message: str, user_history: List[dict]) -> str:
+    """Get response from Groq API"""
+    if not GROQ_AVAILABLE or not GROQ_API_KEY:
+        return "[INFO] Groq API not configured. Set GROQ_API_KEY environment variable and install groq package."
     
     try:
-        # Send welcome message
-        client_socket.send(b"Welcome to the message server!\n")
-        client_socket.send(b"Type 'help' for commands\n\n")
+        client = Groq(api_key=GROQ_API_KEY)
+        
+        # Prepare messages for API
+        messages = []
+        for msg in user_history[-10:]:  # Last 10 messages to avoid token limits
+            messages.append({
+                "role": msg['role'],
+                "content": msg['content']
+            })
+        
+        # Call Groq API
+        chat_completion = client.chat.completions.create(
+            messages=messages,
+            model="openai/gpt-oss-120b",  # Free model
+            max_tokens=1024,
+            temperature=0.7
+        )
+        
+        return chat_completion.choices[0].message.content
+    
+    except Exception as e:
+        logger.error(f"Groq API error: {e}")
+        return f"[ERROR] AI error: {str(e)}"
+
+
+def handle_client(client_socket, addr):
+    """Handle client connection"""
+    logger.info(f"Client connected: {addr}")
+    current_user = None
+    session_id = None
+    
+    try:
+        client_socket.send(b"Welcome! Type 'help' for commands\n\n")
         
         while True:
             data = client_socket.recv(1024).decode('utf-8').strip()
@@ -125,204 +245,341 @@ def handle_client(client_socket, addr):
             parts = data.split(maxsplit=1)
             command = parts[0].lower()
             
-            # Command: help
+            # Authentication commands (no login required)
             if command == 'help':
                 client_socket.send(format_help().encode('utf-8') + b'\n')
             
-            # Command: login
-            elif command == 'login':
+            elif command == 'register':
+                if current_user:
+                    client_socket.send(b"[ERR] Already logged in\n")
+                    continue
+                
                 if len(parts) < 2:
-                    client_socket.send(b"Usage: login <name>\n")
+                    client_socket.send(b"Usage: register <username> <password>\n")
                     continue
                 
-                new_user = parts[1]
-                
-                with lock:
-                    if current_user:
-                        del users[client_socket]
-                    current_user = new_user
-                    users[client_socket] = current_user
-                
-                msg = f"[OK] Logged in as '{current_user}'\n".encode('utf-8')
-                client_socket.send(msg)
-                logger.info(f"User '{current_user}' logged in from {addr}")
-            
-            # Command: send
-            elif command == 'send' or command == 'post':
-                if not current_user:
-                    client_socket.send(b"[ERR] Please login first (login <name>)\n")
-                    continue
-                
-                client_socket.send(b"Enter your message (type 'END' on new line to finish):\n")
-                
-                message_lines = []
-                while True:
-                    try:
-                        line = client_socket.recv(1024).decode('utf-8').rstrip('\n\r')
-                        if line == 'END':
-                            break
-                        message_lines.append(line)
-                    except:
-                        break
-                
-                if not message_lines:
-                    client_socket.send(b"[ERR] Empty message\n")
-                    continue
-                
-                full_message = '\n'.join(message_lines)
-                
-                with lock:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    msg_obj = {
-                        'from': current_user,
-                        'text': full_message,
-                        'time': timestamp
-                    }
-                    messages.append(msg_obj)
-                    save_messages()
-                
-                response = f"[OK] Message posted\n"
-                client_socket.send(response.encode('utf-8'))
-                logger.info(f"User '{current_user}' posted message")
-            
-            # Command: read
-            elif command == 'read' or command == 'view':
-                with lock:
-                    all_messages = list(messages)
-                
-                if not all_messages:
-                    client_socket.send(b"No messages yet\n")
-                else:
-                    response = f"\n{'='*60}\n"
-                    response += f"All messages ({len(all_messages)} total):\n"
-                    response += f"{'='*60}\n"
-                    
-                    for i, msg in enumerate(all_messages, 1):
-                        response += f"\n[{i}] {msg['from']} ({msg['time']})\n"
-                        response += f"    {msg['text']}\n"
-                    
-                    response += f"\n{'='*60}\n"
-                    
-                    client_socket.send(response.encode('utf-8'))
-            
-            # Command: files
-            elif command == 'files':
                 try:
-                    files = os.listdir(FILES_DIR)
-                    if not files:
-                        client_socket.send(b"No files available\n")
+                    reg_parts = parts[1].split()
+                    if len(reg_parts) < 2:
+                        client_socket.send(b"Usage: register <username> <password>\n")
+                        continue
+                    
+                    username, password = reg_parts[0], reg_parts[1]
+                    if register_user(username, password):
+                        client_socket.send(f"[OK] User '{username}' registered\n".encode('utf-8'))
+                        logger.info(f"New user registered: {username}")
                     else:
-                        response = f"\nAvailable files ({len(files)} total):\n"
-                        response += "="*60 + "\n"
-                        for i, fname in enumerate(files, 1):
-                            fpath = os.path.join(FILES_DIR, fname)
-                            fsize = os.path.getsize(fpath)
-                            response += f"[{i}] {fname} ({fsize} bytes)\n"
-                        response += "="*60 + "\n"
-                        client_socket.send(response.encode('utf-8'))
-                except Exception as e:
-                    client_socket.send(f"[ERR] {str(e)}\n".encode('utf-8'))
+                        client_socket.send(b"[ERR] Username taken or invalid\n")
+                except:
+                    client_socket.send(b"[ERR] Invalid format\n")
             
-            # Command: upload
-            elif command == 'upload':
-                if not current_user:
-                    client_socket.send(b"[ERR] Please login first (login <name>)\n")
+            elif command == 'login':
+                if current_user:
+                    client_socket.send(b"[ERR] Already logged in\n")
                     continue
                 
-                client_socket.send(b"Enter filename: ")
-                try:
-                    filename = client_socket.recv(1024).decode('utf-8').strip()
-                    if not filename or '/' in filename or '\\' in filename:
-                        client_socket.send(b"[ERR] Invalid filename\n")
-                        continue
-                    
-                    client_socket.send(b"Enter file size in bytes: ")
-                    file_size = int(client_socket.recv(1024).decode('utf-8').strip())
-                    
-                    if file_size <= 0 or file_size > 100 * 1024 * 1024:  # Max 100MB
-                        client_socket.send(b"[ERR] Invalid file size\n")
-                        continue
-                    
-                    client_socket.send(b"Ready to receive file (sending in base64):\n")
-                    
-                    # Receive base64-encoded file
-                    received_data = b''
-                    bytes_remaining = file_size * 4 // 3 + 10  # Base64 is ~33% larger
-                    
-                    while len(received_data) < bytes_remaining:
-                        chunk = client_socket.recv(8192)
-                        if not chunk:
-                            break
-                        received_data += chunk
-                    
-                    # Decode from base64
-                    try:
-                        file_content = base64.b64decode(received_data.strip())
-                    except Exception as e:
-                        client_socket.send(f"[ERR] Decoding failed: {str(e)}\n".encode('utf-8'))
-                        continue
-                    
-                    # Save file
-                    filepath = os.path.join(FILES_DIR, filename)
-                    with open(filepath, 'wb') as f:
-                        f.write(file_content)
-                    
-                    response = f"[OK] File '{filename}' uploaded ({len(file_content)} bytes)\n"
-                    client_socket.send(response.encode('utf-8'))
-                    logger.info(f"User '{current_user}' uploaded file '{filename}' ({len(file_content)} bytes)")
-                
-                except ValueError:
-                    client_socket.send(b"[ERR] Invalid input\n")
-                except Exception as e:
-                    client_socket.send(f"[ERR] {str(e)}\n".encode('utf-8'))
-            
-            # Command: download
-            elif command == 'download':
                 if len(parts) < 2:
-                    client_socket.send(b"Usage: download <filename>\n")
-                    continue
-                
-                filename = parts[1]
-                if '/' in filename or '\\' in filename:
-                    client_socket.send(b"[ERR] Invalid filename\n")
-                    continue
-                
-                filepath = os.path.join(FILES_DIR, filename)
-                
-                if not os.path.exists(filepath):
-                    client_socket.send(b"[ERR] File not found\n")
+                    client_socket.send(b"Usage: login <username> <password>\n")
                     continue
                 
                 try:
-                    with open(filepath, 'rb') as f:
-                        file_content = f.read()
+                    login_parts = parts[1].split()
+                    if len(login_parts) < 2:
+                        client_socket.send(b"Usage: login <username> <password>\n")
+                        continue
                     
-                    # Encode to base64 for safe transmission
-                    encoded = base64.b64encode(file_content)
+                    username, password = login_parts[0], login_parts[1]
+                    session_id = authenticate_user(username, password)
                     
-                    response = f"[OK] Downloading {filename} ({len(file_content)} bytes)\n".encode('utf-8')
-                    response += encoded
-                    response += b"\n"
-                    
-                    client_socket.send(response)
-                    logger.info(f"User '{current_user}' downloaded file '{filename}'")
-                
-                except Exception as e:
-                    client_socket.send(f"[ERR] {str(e)}\n".encode('utf-8'))
-            elif command == 'users':
-                with lock:
-                    users_list = list(set(users.values()))
-                
-                if not users_list:
-                    client_socket.send(b"No active users\n")
-                else:
-                    response = "Active users:\n"
-                    for user in sorted(users_list):
-                        marker = " (you)" if user == current_user else ""
-                        response += f"  * {user}{marker}\n"
-                    client_socket.send(response.encode('utf-8'))
+                    if session_id:
+                        current_user = username
+                        client_socket.send(f"[OK] Logged in as '{username}'\n".encode('utf-8'))
+                        logger.info(f"User '{username}' logged in from {addr}")
+                    else:
+                        client_socket.send(b"[ERR] Invalid credentials\n")
+                except:
+                    client_socket.send(b"[ERR] Invalid format\n")
             
-            # Command: quit
+            # Commands requiring login
+            elif not current_user:
+                client_socket.send(b"[ERR] Please login first\n")
+            
+            elif command == 'logout':
+                if session_id:
+                    with lock:
+                        if session_id in sessions:
+                            del sessions[session_id]
+                current_user = None
+                session_id = None
+                client_socket.send(b"[OK] Logged out\n")
+            
+            # CHAT commands
+            elif command == 'chat':
+                if len(parts) < 2:
+                    client_socket.send(b"Usage: chat send <message> | chat view [count]\n")
+                    continue
+                
+                action_parts = parts[1].split(maxsplit=1)
+                action = action_parts[0].lower()
+                
+                if action == 'send':
+                    if len(action_parts) < 2:
+                        client_socket.send(b"[ERR] Empty message\n")
+                        continue
+                    
+                    message_text = action_parts[1]
+                    
+                    with lock:
+                        msg_obj = {
+                            'from': current_user,
+                            'text': message_text,
+                            'time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                        chat_messages.append(msg_obj)
+                        save_data()
+                    
+                    client_socket.send(b"[OK] Message sent\n")
+                    logger.info(f"User '{current_user}' sent chat message")
+                
+                elif action == 'view':
+                    count = 100
+                    if len(action_parts) > 1:
+                        try:
+                            count = int(action_parts[1])
+                        except:
+                            pass
+                    
+                    with lock:
+                        msgs = list(chat_messages[-count:])
+                    
+                    if not msgs:
+                        client_socket.send(b"No messages yet\n")
+                    else:
+                        response = f"\n{'='*60}\nChat ({len(msgs)} messages):\n{'='*60}\n"
+                        for i, msg in enumerate(msgs, 1):
+                            response += f"[{i}] {msg['from']} ({msg['time']})\n    {msg['text']}\n"
+                        response += f"{'='*60}\n"
+                        client_socket.send(response.encode('utf-8'))
+                else:
+                    client_socket.send(b"[ERR] Unknown chat action\n")
+            
+            # TASK commands
+            elif command == 'task':
+                if len(parts) < 2:
+                    client_socket.send(b"Usage: task create <title> | task view <id> | task list | task status <id> <status>\n")
+                    continue
+                
+                action_parts = parts[1].split(maxsplit=1)
+                action = action_parts[0].lower()
+                
+                if action == 'create':
+                    if len(action_parts) < 2:
+                        client_socket.send(b"[ERR] Title required\n")
+                        continue
+                    
+                    title = action_parts[1]
+                    task_id = str(uuid.uuid4())[:8]
+                    
+                    with lock:
+                        tasks[task_id] = {
+                            'title': title,
+                            'description': '',
+                            'solution': '',
+                            'status': 'pending',
+                            'created_by': current_user,
+                            'created_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        }
+                        save_data()
+                    
+                    client_socket.send(f"[OK] Task created: {task_id}\n".encode('utf-8'))
+                    logger.info(f"User '{current_user}' created task {task_id}")
+                
+                elif action == 'list':
+                    with lock:
+                        task_list = list(tasks.items())
+                    
+                    if not task_list:
+                        client_socket.send(b"No tasks yet\n")
+                    else:
+                        response = f"\n{'='*60}\nTasks ({len(task_list)} total):\n{'='*60}\n"
+                        for task_id, task in task_list:
+                            response += f"[{task_id}] {task['title']} ({task['status']})\n"
+                            response += f"         by {task['created_by']} - {task['created_at']}\n"
+                        response += f"{'='*60}\n"
+                        client_socket.send(response.encode('utf-8'))
+                
+                elif action == 'view':
+                    try:
+                        view_parts = action_parts[1].split()
+                        task_id = view_parts[0]
+                    except:
+                        client_socket.send(b"Usage: task view <task_id>\n")
+                        continue
+                    
+                    with lock:
+                        task = tasks.get(task_id)
+                    
+                    if not task:
+                        client_socket.send(b"[ERR] Task not found\n")
+                    else:
+                        response = f"\n{'='*60}\nTask: {task_id}\n{'='*60}\n"
+                        response += f"Title:       {task['title']}\n"
+                        response += f"Status:      {task['status']}\n"
+                        response += f"Created by:  {task['created_by']}\n"
+                        response += f"Created at:  {task['created_at']}\n"
+                        response += f"\nDescription:\n{task['description'] or '(none)'}\n"
+                        response += f"\nSolution:\n{task['solution'] or '(none)'}\n"
+                        response += f"{'='*60}\n"
+                        client_socket.send(response.encode('utf-8'))
+                
+                elif action == 'add-desc':
+                    try:
+                        desc_parts = action_parts[1].split()
+                        task_id = desc_parts[0]
+                    except:
+                        client_socket.send(b"Usage: task add-desc <task_id>\n")
+                        continue
+                    
+                    with lock:
+                        if task_id not in tasks:
+                            client_socket.send(b"[ERR] Task not found\n")
+                            continue
+                    
+                    client_socket.send(b"Enter description (type 'END' on new line to finish):\n")
+                    
+                    desc_lines = []
+                    while True:
+                        try:
+                            line = client_socket.recv(1024).decode('utf-8').rstrip('\n\r')
+                            if line == 'END':
+                                break
+                            desc_lines.append(line)
+                        except:
+                            break
+                    
+                    description = '\n'.join(desc_lines)
+                    
+                    with lock:
+                        if task_id in tasks:
+                            tasks[task_id]['description'] = description
+                            save_data()
+                    
+                    client_socket.send(b"[OK] Description saved\n")
+                
+                elif action == 'add-sol':
+                    try:
+                        sol_parts = action_parts[1].split()
+                        task_id = sol_parts[0]
+                    except:
+                        client_socket.send(b"Usage: task add-sol <task_id>\n")
+                        continue
+                    
+                    with lock:
+                        if task_id not in tasks:
+                            client_socket.send(b"[ERR] Task not found\n")
+                            continue
+                    
+                    client_socket.send(b"Enter solution (type 'END' on new line to finish):\n")
+                    
+                    sol_lines = []
+                    while True:
+                        try:
+                            line = client_socket.recv(1024).decode('utf-8').rstrip('\n\r')
+                            if line == 'END':
+                                break
+                            sol_lines.append(line)
+                        except:
+                            break
+                    
+                    solution = '\n'.join(sol_lines)
+                    
+                    with lock:
+                        if task_id in tasks:
+                            tasks[task_id]['solution'] = solution
+                            save_data()
+                    
+                    client_socket.send(b"[OK] Solution saved\n")
+                
+                elif action == 'status':
+                    try:
+                        status_parts = action_parts[1].split()
+                        task_id = status_parts[0]
+                        new_status = status_parts[1] if len(status_parts) > 1 else None
+                    except:
+                        client_socket.send(b"Usage: task status <task_id> <status>\n")
+                        continue
+                    
+                    if new_status not in ['pending', 'in_progress', 'solved']:
+                        client_socket.send(b"[ERR] Status must be: pending, in_progress, or solved\n")
+                        continue
+                    
+                    with lock:
+                        if task_id not in tasks:
+                            client_socket.send(b"[ERR] Task not found\n")
+                        else:
+                            tasks[task_id]['status'] = new_status
+                            save_data()
+                            client_socket.send(f"[OK] Status changed to '{new_status}'\n".encode('utf-8'))
+                
+                elif action == 'delete':
+                    try:
+                        del_parts = action_parts[1].split()
+                        task_id = del_parts[0]
+                    except:
+                        client_socket.send(b"Usage: task delete <task_id>\n")
+                        continue
+                    
+                    with lock:
+                        if task_id in tasks:
+                            del tasks[task_id]
+                            save_data()
+                            client_socket.send(b"[OK] Task deleted\n")
+                        else:
+                            client_socket.send(b"[ERR] Task not found\n")
+                else:
+                    client_socket.send(b"[ERR] Unknown task action\n")
+            
+            # AI CHAT commands
+            elif command == 'ai':
+                if len(parts) < 2:
+                    client_socket.send(b"Usage: ai <message> | ai clear\n")
+                    continue
+                
+                ai_input = parts[1].lower()
+                
+                if ai_input == 'clear':
+                    with lock:
+                        if current_user in ai_chat_history:
+                            ai_chat_history[current_user] = []
+                            save_data()
+                    client_socket.send(b"[OK] AI chat history cleared\n")
+                else:
+                    message = parts[1]
+                    
+                    with lock:
+                        if current_user not in ai_chat_history:
+                            ai_chat_history[current_user] = []
+                        
+                        ai_chat_history[current_user].append({
+                            'role': 'user',
+                            'content': message
+                        })
+                        user_history = list(ai_chat_history[current_user])
+                    
+                    # Get response from Groq API
+                    response_text = get_ai_response(message, user_history)
+                    
+                    with lock:
+                        if current_user in ai_chat_history:
+                            ai_chat_history[current_user].append({
+                                'role': 'assistant',
+                                'content': response_text
+                            })
+                            save_data()
+                    
+                    client_socket.send(f"AI: {response_text}\n".encode('utf-8'))
+                    logger.info(f"User '{current_user}' sent AI message")
+            
             elif command == 'quit' or command == 'exit':
                 client_socket.send(b"Goodbye!\n")
                 break
@@ -335,16 +592,15 @@ def handle_client(client_socket, addr):
     except Exception as e:
         logger.error(f"Error handling client {addr}: {e}")
     finally:
-        with lock:
-            if client_socket in users:
-                logger.info(f"User '{users[client_socket]}' logged out from {addr}")
-                del users[client_socket]
+        if session_id and session_id in sessions:
+            with lock:
+                del sessions[session_id]
         client_socket.close()
 
 
 def start_server():
     """Start the server"""
-    load_messages()
+    load_data()
     
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -357,7 +613,6 @@ def start_server():
     try:
         while True:
             client_socket, addr = server.accept()
-            # Run client handler in separate thread
             thread = threading.Thread(target=handle_client, args=(client_socket, addr))
             thread.daemon = True
             thread.start()
